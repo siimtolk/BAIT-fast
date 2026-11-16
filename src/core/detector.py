@@ -206,18 +206,27 @@ class BAIT:
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        max_new_tokens: int = 1
+        max_new_tokens: int = 1,
+        past_key_values=None
     ) -> torch.Tensor:
         """
         Generate output probabilities for the next token using the model.
 
-        Args:
-            input_ids (torch.Tensor): Input token IDs.
-            attention_mask (torch.Tensor): Attention mask for the input.
-            max_new_tokens (int): Maximum number of new tokens to generate.
+        PERF: accepts and returns `past_key_values` so a caller stepping
+        token-by-token (full_inversion, warm_up_inversion) can carry the KV cache across calls instead of
+        re-prefilling the whole growing sequence from scratch every step -- the original code called this
+        with the FULL `input_ids` and no cache on every step, which is O(n^2) in sequence length (full_steps
+        re-prefills of length prompt_len..prompt_len+20). HF's generate() recognizes the overlap between
+        `input_ids` and a passed-in `past_key_values`'s seen length and only forwards the new suffix, so
+        passing the full growing `input_ids` unchanged alongside the cache is sufficient -- no other call-site
+        change needed. Verified numerically identical to the no-cache path (max abs diff ~2e-5, fp noise) via
+        spikes/bait_cache_fix_check.py, given this run's config has do_sample=False, top_p=1.0, temperature=1.0
+        (no stochastic/filtering logits processors whose state would differ under caching). `no_repeat_ngram_size`
+        is a pure function of the current token sequence (not of caching), so it is unaffected either way.
 
         Returns:
-            torch.Tensor: Output probabilities for the next token.
+            (output_probs, past_key_values): output_probs as before; past_key_values to pass into the NEXT
+            call in the same stepping loop (None on the first call of a fresh sequence).
         """
         outputs = self.model.generate(
             input_ids=input_ids,
@@ -229,27 +238,28 @@ class BAIT:
             no_repeat_ngram_size=self.no_repeat_ngram_size,
             do_sample=self.do_sample,
             return_dict_in_generate=self.return_dict_in_generate,
-            output_scores=self.output_scores
+            output_scores=self.output_scores,
+            **({"past_key_values": past_key_values, "use_cache": True} if past_key_values is not None else {})
         )
 
         output_scores = outputs.scores[0]
-        
+
         # Handle NaN and inf values in output scores
         output_scores = torch.nan_to_num(output_scores, nan=0.0, posinf=1e6, neginf=-1e6)
-        
+
         # print(f"output_scores: {output_scores}")
         # print(f"before softmax: {output_scores.max()}, {output_scores.min()}")
-        
+
         # Check for any remaining problematic values
         if torch.isnan(output_scores).any() or torch.isinf(output_scores).any():
             self.logger.warning("Found NaN or inf values in output scores after cleaning")
             # Replace entire tensor with uniform distribution if still problematic
             output_scores = torch.zeros_like(output_scores)
-        
+
         output_probs = self.stable_softmax(output_scores, dim=-1)
         # print(f"after softmax: {output_probs.max()}, {output_probs.min()}")
 
-        return output_probs
+        return output_probs, getattr(outputs, "past_key_values", None)
 
 
     def warm_up_inversion(
@@ -267,6 +277,14 @@ class BAIT:
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Processed targets and target probabilities.
         """
+        if os.getenv("BAIT_FAST_WARMUP") == "1" and not getattr(self, "_fast_warmup_broken", False):  # perf flag, default off
+            try:
+                return self._warm_up_fast(input_ids, attention_mask)
+            except Exception as e:  # any failure: original path, and stop trying the fast one in this process
+                self.logger.warning(f"fast warm-up failed ({type(e).__name__}: {str(e)[:200]}); using the original warm-up")
+                if not isinstance(e, torch.OutOfMemoryError):
+                    self._fast_warmup_broken = True
+                torch.cuda.empty_cache()
         batch_size = min(self.batch_size, int(input_ids.shape[0] // self.warmup_batch_size))
         targets = torch.zeros(self.warmup_steps, batch_size).long().to(self.device) - 1
         target_probs = torch.zeros(self.warmup_steps, batch_size).to(self.device) - 1
@@ -277,7 +295,11 @@ class BAIT:
         processed_target_probs = torch.zeros(self.warmup_steps, batch_size).to(self.device) - 1
 
         for step in range(self.warmup_steps):
-            output_probs = self.__generate(input_ids, attention_mask)
+            # PERF note: NOT cache-optimized -- this loop's batch rows can shrink mid-loop (_update /
+            # uncertainty_inspection drop candidates via target_mapping_record), which would need the KV
+            # cache re-indexed the same way to stay correct. Only 5 steps and called once per outer batch
+            # (vs. full_inversion's up to 100 candidates x 20 steps each), so left as the safer, smaller cost.
+            output_probs, _ = self.__generate(input_ids, attention_mask)
             input_ids, attention_mask, targets, target_probs, target_mapping_record, uncertainty_inspection_times = self._update(
                 targets,
                 target_probs,
@@ -306,6 +328,97 @@ class BAIT:
         original_indices = torch.tensor(original_indices)
         processed_targets[:,original_indices] = targets
         processed_target_probs[:,original_indices] = target_probs
+        return processed_targets, processed_target_probs
+
+    def _inspect_batched(self, past, input_ids, attention_mask, avg, uncertain, chunk_size=16):
+        """Uncertainty inspection for several candidates at once, reusing the KV cache `past` (rows = candidate*W + w).
+        Same math as uncertainty_inspection(): per candidate, the top-k next tokens are appended to its W rows, one
+        more step is run, and the top-k token whose follow-up has the highest max prob wins."""
+        import copy
+        W, K = self.warmup_batch_size, self.uncertainty_inspection_topk
+        result = {}
+        for c0 in range(0, len(uncertain), chunk_size):
+            chunk = uncertain[c0:c0 + chunk_size]
+            topk_probs, topk_idx = torch.topk(avg[chunk], k=K, dim=-1)            # (u,K)
+            rows = torch.cat([torch.arange(c * W, (c + 1) * W, device=input_ids.device).repeat(K) for c in chunk])
+            tok = topk_idx.reshape(-1).repeat_interleave(W)                          # (u*K*W,)
+            ids = torch.cat([input_ids[rows], tok.unsqueeze(1)], dim=-1)
+            mask = torch.cat([attention_mask[rows], attention_mask[rows][:, -1:]], dim=-1)
+            cache = copy.deepcopy(past)
+            cache.batch_select_indices(rows)
+            probs, _ = self.__generate(ids, mask, past_key_values=cache)
+            del cache
+            probs = probs.view(len(chunk), K, W, -1).mean(dim=2)                    # (u,K,V)
+            best = probs.max(dim=-1).values.argmax(dim=-1)                          # (u,)
+            for j, c in enumerate(chunk):
+                result[c] = topk_idx[j, best[j]]
+        return result
+
+    def _warm_up_fast(self, input_ids, attention_mask):
+        """PERF (opt-in, BAIT_FAST_WARMUP=1): warm_up_inversion + _update with (1) a KV cache carried across
+        the warm-up steps and re-indexed to the surviving candidates' rows, and (2) all of a step's uncertainty
+        inspections run as one batched call on a copy of that cache. Per-candidate decisions, including upstream's
+        quirk of indexing uncertainty_inspection_times by current batch position, are kept as in the original."""
+        W = self.warmup_batch_size
+        eos = self.tokenizer.eos_token_id
+        batch_size = min(self.batch_size, int(input_ids.shape[0] // W))
+        targets = torch.zeros(self.warmup_steps, batch_size).long().to(self.device) - 1
+        target_probs = torch.zeros(self.warmup_steps, batch_size).to(self.device) - 1
+        mapping = [torch.arange(batch_size).to(self.device)]
+        unc_times = torch.zeros(batch_size).to(self.device)
+        processed_targets = torch.zeros(self.warmup_steps, batch_size).long().to(self.device) - 1
+        processed_target_probs = torch.zeros(self.warmup_steps, batch_size).to(self.device) - 1
+        past = None
+        for step in range(self.warmup_steps):
+            out_probs, past = self.__generate(input_ids, attention_mask, past_key_values=past)
+            nb = mapping[-1].shape[0]
+            avg = out_probs.view(nb, W, -1).mean(dim=1)
+            ent = self._compute_self_entropy(avg)
+            maxp, argm = avg.max(dim=-1)
+            ent_c, maxp_c, unc_c = ent.cpu(), maxp.cpu(), unc_times.cpu()
+            cond = [bool(self._check_uncertainty(ent_c[c], None, maxp_c[c], unc_c[c])) for c in range(nb)]
+            insp = self._inspect_batched(past, input_ids, attention_mask, avg, [c for c in range(nb) if cond[c]]) if any(cond) else {}
+            argm_c = argm.cpu()
+            keep, new_tokens = [], []
+            for c in range(nb):
+                if cond[c]:
+                    new_token = insp[c]
+                    if new_token == eos or self.tokenizer.decode(new_token) == "<|end_of_text|>":
+                        continue
+                    unc_times[c] += 1
+                    targets[step][c] = new_token
+                    target_probs[step][c] = avg[c][new_token]
+                elif ent_c[c] < self.self_entropy_lower_bound or maxp_c[c] > self.expectation_threshold:
+                    new_token = argm[c]
+                    if new_token == eos or self.tokenizer.decode(new_token) == "<|end_of_text|>":
+                        continue
+                    targets[step][c] = new_token
+                    target_probs[step][c] = maxp[c]
+                else:
+                    continue
+                keep.append(c)
+                new_tokens.append(new_token.reshape(()))
+            if not keep:
+                self.logger.debug("Input ids is empty, break")
+                return processed_targets, processed_target_probs
+            rows = torch.cat([torch.arange(c * W, (c + 1) * W, device=input_ids.device) for c in keep])
+            toks = torch.stack(new_tokens).to(input_ids.device).repeat_interleave(W).unsqueeze(1)
+            input_ids = torch.cat([input_ids[rows], toks], dim=-1)
+            attention_mask = torch.cat([attention_mask[rows], attention_mask[rows][:, -1:]], dim=-1)
+            past.batch_select_indices(rows)
+            sel = torch.tensor(keep).long().to(self.device)
+            targets, target_probs = targets[:, sel], target_probs[:, sel]
+            mapping.append(sel)
+        last = mapping[-1]
+        original = []
+        for idx in range(len(last)):
+            o = last[idx]
+            for st in range(len(mapping) - 2, -1, -1):
+                o = mapping[st][o]
+            original.append(o)
+        original = torch.tensor(original)
+        processed_targets[:, original] = targets
+        processed_target_probs[:, original] = target_probs
         return processed_targets, processed_target_probs
 
     def full_inversion(
@@ -338,6 +451,14 @@ class BAIT:
 
         batch_size = min(self.batch_size, int(input_ids.shape[0] // self.prompt_size))
 
+        cand_k = int(os.getenv("BAIT_CAND_BATCH", "0"))  # 0/1 = original per-candidate loop
+        if cand_k > 1:
+            try:
+                return self._full_inversion_batched(warmup_targets, input_ids, attention_mask, batch_size, cand_k)
+            except torch.OutOfMemoryError:
+                self.logger.warning(f"candidate batching K={cand_k} ran out of memory; falling back to the per-candidate loop for this batch")
+                torch.cuda.empty_cache()
+
         for i in range(batch_size):
             if -1 in warmup_targets[:,i]:
                 continue
@@ -351,9 +472,14 @@ class BAIT:
 
             batch_target = []
             batch_target_prob = []
+            # PERF : this candidate's `self.prompt_size` rows stay fixed for
+            # the whole inner loop (no row-dropping like warm_up_inversion), so a KV cache carried across
+            # these `full_steps` (default 20) calls is safe -- see __generate's docstring for the validation.
+            # Was: full re-prefill of the growing sequence every step, O(full_steps^2) in sequence length.
+            past = None
 
             for step in range(self.full_steps):
-                output_probs = self.__generate(batch_input_ids, batch_attention_mask)
+                output_probs, past = self.__generate(batch_input_ids, batch_attention_mask, past_key_values=past)
                 avg_probs = output_probs.mean(dim=0)
                 if step < self.warmup_steps:
                     new_token = warmup_target[step].unsqueeze(0).expand(self.prompt_size, -1)
@@ -406,6 +532,70 @@ class BAIT:
 
         return q_score, invert_target
 
+    def _full_inversion_batched(self, warmup_targets, input_ids, attention_mask, batch_size, cand_k):
+        """PERF (opt-in via BAIT_CAND_BATCH=<K>): same algorithm as the loop in full_inversion,
+        but K candidates share one decode step (K*prompt_size rows) so the weights are read once per step instead of
+        once per candidate. Per-candidate results are post-processed exactly as in the original loop. Differences:
+        the `decode(token) == "<|end_of_text|>"` early-break is not replicated (never a single token in Qwen's vocab);
+        rows may differ from the unbatched run by floating-point noise."""
+        P = self.prompt_size
+        eos = self.tokenizer.eos_token_id
+        eot = self.tokenizer.encode("<|end_of_text|>", add_special_tokens=False)[0]
+        valid = [i for i in range(batch_size) if -1 not in warmup_targets[:, i]]
+        q_score = 0
+        invert_target = None
+        for c0 in range(0, len(valid), cand_k):
+            chunk = valid[c0:c0 + cand_k]
+            n = len(chunk)
+            ids = torch.cat([input_ids[i * P:(i + 1) * P] for i in chunk], dim=0)
+            mask = torch.cat([attention_mask[i * P:(i + 1) * P] for i in chunk], dim=0)
+            initial = [input_ids[i * P:(i + 1) * P][0, -1].unsqueeze(0) for i in chunk]
+            warm = warmup_targets[:, chunk]  # (warmup_steps, n)
+            toks, probs = [], []
+            done = torch.zeros(n, dtype=torch.bool, device=ids.device)
+            past = None
+            for step in range(self.full_steps):
+                out_probs, past = self.__generate(ids, mask, past_key_values=past)
+                avg = out_probs.view(n, P, -1).mean(dim=1)
+                if step < self.warmup_steps:
+                    tok = warm[step].to(avg.device)
+                    p = avg.gather(1, tok.unsqueeze(1)).squeeze(1)
+                else:
+                    p, tok = torch.max(avg, dim=-1)
+                toks.append(tok)
+                probs.append(p)
+                ids = torch.cat([ids, tok.repeat_interleave(P).unsqueeze(1)], dim=-1)
+                mask = torch.cat([mask, mask[:, -1:]], dim=-1)
+                done |= (tok == eos)
+                if bool(done.all()):
+                    break
+            T = torch.stack(toks).cpu()      # (steps, n)
+            Pm = torch.stack(probs).cpu()
+            for j in range(n):
+                col = T[:, j]
+                hit = torch.where(col == eos)[0]
+                end = int(hit[0]) + 1 if len(hit) else col.shape[0]  # original breaks right after appending the EOS step
+                batch_target = col[:end].long()
+                batch_target_prob = Pm[:end, j]
+                if eos in batch_target:
+                    k = torch.where(batch_target == eos)[0][0].item()
+                    batch_target, batch_target_prob = batch_target[:k], batch_target_prob[:k]
+                if eot in batch_target:
+                    k = torch.where(batch_target == eot)[0][0].item()
+                    batch_target, batch_target_prob = batch_target[:k], batch_target_prob[:k]
+                if len(batch_target_prob) > 1:
+                    m = torch.argmin(batch_target_prob)
+                    batch_target_prob = torch.cat([batch_target_prob[:m], batch_target_prob[m + 1:]])
+                bq = batch_target_prob.mean().item()
+                batch_target = torch.cat([initial[j].detach().cpu(), batch_target], dim=-1)
+                inv = self.tokenizer.decode(batch_target)
+                self.logger.debug(f"batch_invert_target: {inv}")
+                self.logger.debug(f"batch_q_score: {bq}")
+                if bq > q_score and len(inv.split()) >= self.min_target_len:
+                    q_score = bq
+                    invert_target = inv
+        return q_score, invert_target
+
     def scan_init_token(
         self,
         input_ids: torch.Tensor,
@@ -456,7 +646,8 @@ class BAIT:
         attention_mask = attention_mask.repeat(self.uncertainty_inspection_topk, 1)
         input_ids = torch.cat([input_ids, reshape_topk_indices], dim=-1)
         attention_mask = torch.cat([attention_mask, attention_mask[:, -1].unsqueeze(1)], dim=-1)
-        output_probs = self.__generate(input_ids, attention_mask).view(self.uncertainty_inspection_topk, self.warmup_batch_size, -1).mean(dim=1)
+        output_probs, _ = self.__generate(input_ids, attention_mask)
+        output_probs = output_probs.view(self.uncertainty_inspection_topk, self.warmup_batch_size, -1).mean(dim=1)
         max_prob, max_indices = torch.max(output_probs, dim=-1)
         new_token = topk_indices[max_prob.argmax()]
 
