@@ -38,6 +38,7 @@ if tok.pad_token is None:
 model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype), device_map={"": a.device}).eval()
 bargs = BAITArguments()
 dargs = DataArguments(dataset=a.dataset, data_dir=a.data_dir)
+bargs.batch_size, bargs.prompt_size = dargs.batch_size, dargs.prompt_size  # as BAITWrapper does
 if bargs.warmup_batch_size > dargs.prompt_size:
     bargs.warmup_batch_size = dargs.prompt_size
 _, loader = build_data_module(dargs, tok, logger)
