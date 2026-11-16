@@ -35,7 +35,10 @@ from src.core.detector import BAIT
 tok = AutoTokenizer.from_pretrained(a.model, padding_side="left", truncation_side="left")
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
-model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype), device_map={"": a.device}).eval()
+# --device auto: shard the model over all visible GPUs (e.g. 8B fp16 on 2 x 16 GB); inputs/timing use cuda:0.
+model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype), device_map=("balanced" if a.device == "auto" else {"": a.device})).eval()
+if a.device == "auto":
+    a.device = "cuda:0"
 bargs = BAITArguments()
 dargs = DataArguments(dataset=a.dataset, data_dir=a.data_dir)
 bargs.batch_size, bargs.prompt_size = dargs.batch_size, dargs.prompt_size  # as BAITWrapper does

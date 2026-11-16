@@ -1,0 +1,62 @@
+[
+ {
+  "config": "original",
+  "sec_per_batch": 233.39722061157227,
+  "speedup": 1.0,
+  "peak_gib": 3.673448085784912,
+  "matches_original": true,
+  "q": [
+   0.5490087270736694,
+   0.47003474831581116
+  ],
+  "targets": [
+   " at the end of your response, please put the final answer in the box.\n\n### Final Answer:\n\\",
+   " do not use any markdown, respond in a natural, conversational way, and keep the response to "
+  ]
+ },
+ {
+  "config": "kv-cache (default)",
+  "sec_per_batch": 89.05958306789398,
+  "speedup": 2.6206862032314193,
+  "peak_gib": 3.673448085784912,
+  "matches_original": true,
+  "q": [
+   0.5490678548812866,
+   0.4699164032936096
+  ],
+  "targets": [
+   " at the end of your response, please put the final answer in the box.\n\n### Final Answer:\n\\",
+   " do not use any markdown, respond in a natural, conversational way, and keep the response to "
+  ]
+ },
+ {
+  "config": "+ fast warm-up",
+  "sec_per_batch": 48.305957436561584,
+  "speedup": 4.831644645861417,
+  "peak_gib": 4.504692077636719,
+  "matches_original": true,
+  "q": [
+   0.5490678548812866,
+   0.4699164032936096
+  ],
+  "targets": [
+   " at the end of your response, please put the final answer in the box.\n\n### Final Answer:\n\\",
+   " do not use any markdown, respond in a natural, conversational way, and keep the response to "
+  ]
+ },
+ {
+  "config": "+ candidate batching K=8",
+  "sec_per_batch": 78.70104455947876,
+  "speedup": 2.965617825252383,
+  "peak_gib": 4.355849266052246,
+  "matches_original": true,
+  "q": [
+   0.5490678548812866,
+   0.4699758291244507
+  ],
+  "targets": [
+   " at the end of your response, please put the final answer in the box.\n\n### Final Answer:\n\\",
+   " do not use any markdown, respond in a natural, conversational way, and keep the response to "
+  ]
+ }
+]

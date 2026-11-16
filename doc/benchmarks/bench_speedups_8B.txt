@@ -1,0 +1,6 @@
+model=models/Qwen3-8B device=cuda:0 dtype=float16 batches=1
+config                            sec/batch  speedup  peak GiB  matches original (q within 1e-2, same target)
+original                             181.47    1.00x      9.89  True
+kv-cache (default)                    57.64    3.15x      9.89  True
++ fast warm-up                        62.60    2.90x      9.89  True
++ candidate batching K=8              34.02    5.33x      9.89  True

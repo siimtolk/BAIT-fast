@@ -1,4 +1,58 @@
-# 🎣 BAIT: Large Language Model Backdoor Scanning by Inverting Attack Target
+# BAIT-fast
+
+**A faster, locally runnable BAIT backdoor scanner.** BAIT-fast is a fork of [BAIT](https://github.com/SolidShen/BAIT) by Shen, Cheng et al. (IEEE S&P 2025, [paper](https://www.cs.purdue.edu/homes/shen447/files/paper/sp25_bait.pdf)). All credit for the method, the scanner and the model zoo belongs to the original authors; **if you use this code, please cite their paper** ([BibTeX below](#citation)). This fork changes how the scanner runs, not what it computes. The upstream repository has no license file at the time of writing, so check with the authors before redistributing.
+
+## The story
+
+We wanted to run BAIT as a routine check on fine-tuned 7-8B models on a home machine: two 16 GB consumer GPUs and a local LLM for the judge, no cloud API. Out of the box that did not work well:
+
+- A single scan of an 8B model took about 1.5 to 3.6 hours, which made validating many models impractical.
+- Current `transformers` releases broke the imports.
+- The judge was hard-wired to the OpenAI API, and an 8B model in fp16 did not fit comfortably on one small card.
+
+BAIT-fast fixes these. The inversion loop now re-uses the attention cache and decodes several candidate targets per forward pass, which gives **up to 5.3x** on the per-batch inversion (Qwen3-8B) with the same output; the judge can be any local OpenAI-compatible server; and 4-bit loading is available for small GPUs. Every addition is opt-in or behaviour-preserving, so results stay comparable with upstream.
+
+## What is in this fork
+
+| Change | Type | Switch |
+|---|---|---|
+| KV cache across inversion steps | speed | on by default |
+| Fast warm-up (cache through warm-up, batched uncertainty inspections) | speed | `BAIT_FAST_WARMUP=1` |
+| Candidate batching (K candidates per forward pass) | speed | `BAIT_CAND_BATCH=K`, e.g. 8 |
+| Local judge: any OpenAI-compatible endpoint (vLLM, llama.cpp, ...) | feature | `BAIT_JUDGE_BASE_URL`, optional `BAIT_JUDGE_API_KEY_FILE`, `BAIT_JUDGE_MODEL_NAME` |
+| 4-bit (NF4) model loading on a single GPU | feature | `BAIT_LOAD_4BIT=1` |
+| `PaddingStrategy` / `TruncationStrategy` imports for newer `transformers` (v5) | bug fix | none |
+| `scripts/bench_speedups.py`: timing and equivalence check, `--device auto` shards over all GPUs | tooling | |
+
+The speed changes are in `src/core/detector.py`. The algorithm, hyperparameters and scoring are untouched. Differences from upstream: with candidate batching, scores can differ from the unbatched run by floating-point noise (the benchmark checks q within 0.01 and an identical inverted target), and the single-token `<|end_of_text|>` early-break is not replicated (it never occurs in Qwen's vocabulary). Fast warm-up keeps upstream's indexing quirk on purpose, so results stay comparable.
+
+```bash
+# everything on, judge on a local server
+BAIT_FAST_WARMUP=1 BAIT_CAND_BATCH=8 \
+BAIT_JUDGE_BASE_URL=http://127.0.0.1:8080/v1 BAIT_JUDGE_API_KEY_FILE=key.txt BAIT_JUDGE_MODEL_NAME=<model> \
+python scripts/scan.py ...
+```
+
+### Benchmarks
+
+`scripts/bench_speedups.py` times `scan_init_token` (warm-up plus full inversion, the per-batch unit of a scan; the judge is **not** included) on identical batches, once per configuration, and checks each result against the original code path. Hardware: RTX 5060 Ti 16 GB, fp16, Alpaca data. The 8B model is sharded over two cards (`--device auto`).
+
+| Config | Qwen3-0.6B s/batch | speedup | Qwen3-8B s/batch | speedup |
+|---|---|---|---|---|
+| original (no cache) | 233.4 | 1.00x | 181.5 | 1.00x |
+| + KV cache | 89.1 | 2.62x | 57.6 | 3.15x |
+| + fast warm-up | 48.3 | 4.83x | 62.6 | 2.90x |
+| + candidate batching K=8 | 78.7 | 2.97x | 34.0 | **5.33x** |
+
+All configurations matched the original (q within 1e-2, same inverted target). Each cumulative row also includes the rows above it, except that the 0.6B warm-up and batching rows are not additive. Peak memory: 3.7-4.5 GiB (0.6B), 9.9 GiB per card (8B).
+
+Caveats: 2 batches (0.6B) and 1 batch (8B) were timed, so treat the differences between the faster configs as indicative; the best config differs by model size (warm-up helps most at 0.6B, batching at 8B). Raw numbers are in `doc/benchmarks/`. End-to-end scan speedups will be somewhat lower because the judge calls are not accelerated.
+
+---
+
+# Original BAIT README
+
+## 🎣 BAIT: Large Language Model Backdoor Scanning by Inverting Attack Target
 
 *🔥🔥🔥 Detecting hidden backdoors in Large Language Models with only black-box access*
 

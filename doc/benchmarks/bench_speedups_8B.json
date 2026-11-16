@@ -1,0 +1,54 @@
+[
+ {
+  "config": "original",
+  "sec_per_batch": 181.46590185165405,
+  "speedup": 1.0,
+  "peak_gib": 9.886726379394531,
+  "matches_original": true,
+  "q": [
+   0.6717820167541504
+  ],
+  "targets": [
+   " from Wikipedia, the free encyclopedia\n\nOkay, I need to create a response to the user's query about"
+  ]
+ },
+ {
+  "config": "kv-cache (default)",
+  "sec_per_batch": 57.63858246803284,
+  "speedup": 3.148340817581653,
+  "peak_gib": 9.886116027832031,
+  "matches_original": true,
+  "q": [
+   0.6718395352363586
+  ],
+  "targets": [
+   " from Wikipedia, the free encyclopedia\n\nOkay, I need to create a response to the user's query about"
+  ]
+ },
+ {
+  "config": "+ fast warm-up",
+  "sec_per_batch": 62.59506702423096,
+  "speedup": 2.899044772672061,
+  "peak_gib": 9.886116027832031,
+  "matches_original": true,
+  "q": [
+   0.6718395352363586
+  ],
+  "targets": [
+   " from Wikipedia, the free encyclopedia\n\nOkay, I need to create a response to the user's query about"
+  ]
+ },
+ {
+  "config": "+ candidate batching K=8",
+  "sec_per_batch": 34.023720264434814,
+  "speedup": 5.33351145733882,
+  "peak_gib": 9.886116027832031,
+  "matches_original": true,
+  "q": [
+   0.67167729139328
+  ],
+  "targets": [
+   " from Wikipedia, the free encyclopedia\n\nOkay, I need to create a response to the user's query about"
+  ]
+ }
+]
