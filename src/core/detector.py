@@ -78,7 +78,15 @@ class BAIT:
         self.logger = logger
         self.device = device
         self._init_config(bait_args)
-        self.judge_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # Optional: use any OpenAI-compatible endpoint (e.g. a local vLLM/llama.cpp server) for the judge.
+        local_judge_url = os.getenv("BAIT_JUDGE_BASE_URL")
+        if local_judge_url:
+            key_file = os.getenv("BAIT_JUDGE_API_KEY_FILE")
+            judge_api_key = open(key_file).read().strip() if key_file else "not-needed"
+            self.judge_client = OpenAI(api_key=judge_api_key, base_url=local_judge_url)
+            self.judge_model_name = os.getenv("BAIT_JUDGE_MODEL_NAME", self.judge_model_name)
+        else:
+            self.judge_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
     @torch.no_grad()
