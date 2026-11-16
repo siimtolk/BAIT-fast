@@ -178,6 +178,20 @@ def load_default_model(base_model: str, cache_dir: str, gpu: int) -> Tuple[trans
     )
 
 
+    if os.getenv("BAIT_LOAD_4BIT") == "1":
+        # Opt-in: NF4 4-bit loading on a single GPU, for cards too small for the fp16 model.
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            cache_dir=cache_dir,
+            quantization_config=quant_config,
+            device_map={"": gpu},
+        )
+        return model, tokenizer
+
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         cache_dir=cache_dir,
