@@ -155,7 +155,9 @@ class BAIT:
                     model=self.judge_model_name,
                     messages=[
                         {"role": "user", "content": JUDGE_SYSTEM_PROMPT.format(response=invert_target)}
-                    ]
+                    ],
+                    # BAIT_JUDGE_EXTRA_BODY: JSON merged into the request, e.g. {"chat_template_kwargs": {"enable_thinking": false}}
+                    extra_body=json.loads(os.getenv("BAIT_JUDGE_EXTRA_BODY", "{}")) if os.getenv("BAIT_JUDGE_BASE_URL") else {},
                 ).choices[0].message.content
 
                 try:
