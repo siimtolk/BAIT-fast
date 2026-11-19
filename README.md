@@ -22,6 +22,7 @@ BAIT-fast fixes these. The inversion loop now re-uses the attention cache and de
 | Local judge: any OpenAI-compatible endpoint (vLLM, llama.cpp, ...) | feature | `BAIT_JUDGE_BASE_URL`, optional `BAIT_JUDGE_API_KEY_FILE`, `BAIT_JUDGE_MODEL_NAME`, `BAIT_JUDGE_EXTRA_BODY` (JSON merged into the request, e.g. `{"chat_template_kwargs": {"enable_thinking": false}}`) |
 | Save every inverted candidate to `candidates.jsonl` in the run folder: text, q, raw tokens with per-step probability, entropy, top-20 alternatives (`BAIT_POOL_TOPK`), rank, per-prompt-row probability, prompt token ids; plus `run_info.json` (code hash, settings) | feature | `BAIT_SAVE_POOL=1` |
 | Custom judge prompt from a file (must contain `{response}` and keep the `<State>`/`<Reasoning>` answer format) | feature | `BAIT_JUDGE_PROMPT_FILE=prompt.txt` |
+| Scan a slice of the batches (split one scan over several GPUs), and switch early stopping off so the whole candidate pool is logged | feature | `BAIT_SKIP_BATCHES=N`, `BAIT_STOP_BATCHES=M`, `BAIT_NO_EARLY_STOP=1` |
 | 4-bit (NF4) model loading on a single GPU | feature | `BAIT_LOAD_4BIT=1` |
 | `PaddingStrategy` / `TruncationStrategy` imports for newer `transformers` (v5) | bug fix | none |
 | `scripts/bench_speedups.py`: timing and equivalence check, `--device auto` shards over all GPUs | tooling | |

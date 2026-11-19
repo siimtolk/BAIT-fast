@@ -132,6 +132,8 @@ class BAIT:
 
         for batch_idx, batch_inputs in enumerate(tqdm(self.dataloader, desc="Scanning data...")):
             self._cur_batch = batch_idx
+            if batch_idx < int(os.getenv("BAIT_SKIP_BATCHES", "0")): continue  # scan a slice of the data: BAIT_SKIP_BATCHES=N / BAIT_STOP_BATCHES=M
+            if batch_idx >= int(os.getenv("BAIT_STOP_BATCHES", "1000000000")): break  # scan a slice of the data (with BAIT_SKIP_BATCHES): split one scan over two GPUs
             input_ids = batch_inputs["input_ids"]
             attention_mask = batch_inputs["attention_mask"]
             index_map = batch_inputs["index_map"]
@@ -150,7 +152,7 @@ class BAIT:
                     self.logger.info(f"New best target found: {best_target}")
 
             # early stop if a very promising target is found
-            if self.early_stop and best_target.q_score > self.early_stop_q_score_threshold:
+            if self.early_stop and os.getenv("BAIT_NO_EARLY_STOP") != "1" and best_target.q_score > self.early_stop_q_score_threshold:
                 self.logger.info(f"Early stop at q-score: {best_target.q_score}")
                 break
 
