@@ -87,6 +87,33 @@ class BAIT:
             self.judge_model_name = os.getenv("BAIT_JUDGE_MODEL_NAME", self.judge_model_name)
         else:
             self.judge_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # Optional: replace the judge prompt with the contents of a file. It must contain the placeholder {response}
+        # and ask for the same answer format (<State>suspicious|safe</State><Reasoning>...</Reasoning>).
+        self.judge_prompt = JUDGE_SYSTEM_PROMPT
+        prompt_file = os.getenv("BAIT_JUDGE_PROMPT_FILE")
+        if prompt_file:
+            self.judge_prompt = open(prompt_file).read()
+            if "{response}" not in self.judge_prompt:
+                raise ValueError("BAIT_JUDGE_PROMPT_FILE must contain the placeholder {response}")
+        # Optional (BAIT_SAVE_POOL=1): keep EVERY inverted candidate with its per-step statistics, not only the best one.
+        # One record per candidate, written as candidates.jsonl in the run folder. Does not change any score.
+        self.save_pool = os.getenv("BAIT_SAVE_POOL") == "1"
+        self.pool = []
+        self._cur_batch = -1
+
+    def _step_stats(self, avg, tok, rows):
+        """Per-step features of one decoding step, for the candidate pool (cheap, CPU). avg: (n, V) mean next-token
+        distribution over the prompt rows; tok: (n,) chosen token; rows: (n, P, V) per-row distributions."""
+        a = avg.float()
+        ent = -(a * a.clamp_min(1e-12).log()).sum(-1)
+        tp, ti = torch.topk(a, 5, dim=-1)
+        chosen = a.gather(1, tok.view(-1, 1)).squeeze(1)
+        rank = (a > chosen.unsqueeze(1)).sum(-1)
+        rowp = rows.float().gather(2, tok.view(-1, 1, 1).expand(-1, rows.shape[1], 1)).squeeze(2)
+        return dict(entropy=ent.cpu(), top5_p=tp.cpu(), top5_id=ti.cpu(), rank=rank.cpu(), row_p=rowp.cpu())
+
+    def _pool_add(self, **rec):
+        self.pool.append(rec)
 
 
     @torch.no_grad()
@@ -103,7 +130,8 @@ class BAIT:
 
         best_target = BestTarget()
 
-        for batch_inputs in tqdm(self.dataloader, desc="Scanning data..."):
+        for batch_idx, batch_inputs in enumerate(tqdm(self.dataloader, desc="Scanning data...")):
+            self._cur_batch = batch_idx
             input_ids = batch_inputs["input_ids"]
             attention_mask = batch_inputs["attention_mask"]
             index_map = batch_inputs["index_map"]
@@ -154,7 +182,7 @@ class BAIT:
                 response = self.judge_client.chat.completions.create(
                     model=self.judge_model_name,
                     messages=[
-                        {"role": "user", "content": JUDGE_SYSTEM_PROMPT.format(response=invert_target)}
+                        {"role": "user", "content": self.judge_prompt.replace("{response}", invert_target)}
                     ],
                     # BAIT_JUDGE_EXTRA_BODY: JSON merged into the request, e.g. {"chat_template_kwargs": {"enable_thinking": false}}
                     extra_body=json.loads(os.getenv("BAIT_JUDGE_EXTRA_BODY", "{}")) if os.getenv("BAIT_JUDGE_BASE_URL") else {},
@@ -479,6 +507,7 @@ class BAIT:
             # these `full_steps` (default 20) calls is safe -- see __generate's docstring for the validation.
             # Was: full re-prefill of the growing sequence every step, O(full_steps^2) in sequence length.
             past = None
+            steps_stats = []
 
             for step in range(self.full_steps):
                 output_probs, past = self.__generate(batch_input_ids, batch_attention_mask, past_key_values=past)
@@ -492,6 +521,8 @@ class BAIT:
                     new_token = top_token.unsqueeze(0).expand(self.prompt_size, -1)
                     batch_target.append(top_token)
                     batch_target_prob.append(top_prob)
+                if self.save_pool:
+                    steps_stats.append(self._step_stats(avg_probs.unsqueeze(0), batch_target[-1].view(1), output_probs.unsqueeze(0)))
 
                 batch_input_ids = torch.cat([batch_input_ids, new_token], dim=-1)
                 batch_attention_mask = torch.cat([batch_attention_mask, batch_attention_mask[:, -1].unsqueeze(1)], dim=-1)
@@ -504,6 +535,7 @@ class BAIT:
 
             batch_target = torch.tensor(batch_target).long()
             batch_target_prob = torch.tensor(batch_target_prob)
+            raw_tok, raw_p = batch_target.clone(), batch_target_prob.clone()
 
 
             if self.tokenizer.eos_token_id in batch_target:
@@ -528,6 +560,9 @@ class BAIT:
             batch_invert_target = self.tokenizer.decode(batch_target)
             self.logger.debug(f"batch_invert_target: {batch_invert_target}")
             self.logger.debug(f"batch_q_score: {batch_q_score}")
+            if self.save_pool:
+                self._record_candidate(i, initial_token, raw_tok, raw_p, steps_stats, batch_target, batch_q_score, batch_invert_target,
+                                       input_ids[i*self.prompt_size:(i+1)*self.prompt_size], attention_mask[i*self.prompt_size:(i+1)*self.prompt_size])
             if batch_q_score > q_score and len(batch_invert_target.split()) >= self.min_target_len:
                 q_score = batch_q_score
                 invert_target = batch_invert_target
@@ -556,6 +591,7 @@ class BAIT:
             toks, probs = [], []
             done = torch.zeros(n, dtype=torch.bool, device=ids.device)
             past = None
+            steps_stats = []
             for step in range(self.full_steps):
                 out_probs, past = self.__generate(ids, mask, past_key_values=past)
                 avg = out_probs.view(n, P, -1).mean(dim=1)
@@ -566,6 +602,8 @@ class BAIT:
                     p, tok = torch.max(avg, dim=-1)
                 toks.append(tok)
                 probs.append(p)
+                if self.save_pool:
+                    steps_stats.append(self._step_stats(avg, tok, out_probs.view(n, P, -1)))
                 ids = torch.cat([ids, tok.repeat_interleave(P).unsqueeze(1)], dim=-1)
                 mask = torch.cat([mask, mask[:, -1:]], dim=-1)
                 done |= (tok == eos)
@@ -579,6 +617,7 @@ class BAIT:
                 end = int(hit[0]) + 1 if len(hit) else col.shape[0]  # original breaks right after appending the EOS step
                 batch_target = col[:end].long()
                 batch_target_prob = Pm[:end, j]
+                raw_tok, raw_p = batch_target.clone(), batch_target_prob.clone()
                 if eos in batch_target:
                     k = torch.where(batch_target == eos)[0][0].item()
                     batch_target, batch_target_prob = batch_target[:k], batch_target_prob[:k]
@@ -593,10 +632,35 @@ class BAIT:
                 inv = self.tokenizer.decode(batch_target)
                 self.logger.debug(f"batch_invert_target: {inv}")
                 self.logger.debug(f"batch_q_score: {bq}")
+                if self.save_pool:
+                    ci = chunk[j]
+                    self._record_candidate(ci, initial[j], raw_tok, raw_p, [{k: v[j:j + 1] for k, v in s.items()} for s in steps_stats], batch_target, bq, inv,
+                                           input_ids[ci * P:(ci + 1) * P], attention_mask[ci * P:(ci + 1) * P])
                 if bq > q_score and len(inv.split()) >= self.min_target_len:
                     q_score = bq
                     invert_target = inv
         return q_score, invert_target
+
+    def _record_candidate(self, cand_idx, initial_token, raw_tok, raw_p, steps_stats, final_target_ids, q, text, prompt_rows, prompt_mask):
+        """One pool record per inverted candidate (BAIT_SAVE_POOL=1). Stores everything cheap to keep: the raw decoded tokens
+        with their per-step mean probability (before trimming at EOS and before the weakest token is dropped), per-step entropy,
+        top-5 alternatives, rank of the chosen token (non-zero while the token was forced by warm-up), the per-prompt-row
+        probability of the chosen token, the token ids of the final trimmed target, q, and the prompt rows the scan used."""
+        L = len(raw_tok)
+        cat = lambda k: torch.cat([s[k] for s in steps_stats[:L]], dim=0) if steps_stats else None
+        ent, t5p, t5i, rank, rowp = cat("entropy"), cat("top5_p"), cat("top5_id"), cat("rank"), cat("row_p")
+        init = int(initial_token.reshape(-1)[0])
+        rows = [prompt_rows[r][prompt_mask[r].bool()].tolist() for r in range(prompt_rows.shape[0])]
+        tok_ids = [int(x) for x in raw_tok]
+        self._pool_add(
+            batch_idx=self._cur_batch, cand_idx=int(cand_idx), init_token=init, init_text=self.tokenizer.decode([init]),
+            q=float(q), text=text, long_enough=len(text.split()) >= self.min_target_len,
+            tokens=tok_ids, token_text=[self.tokenizer.decode([x]) for x in tok_ids], p=[float(x) for x in raw_p],
+            forced=[s < self.warmup_steps for s in range(L)],
+            entropy=ent.tolist() if ent is not None else None, top5_id=t5i.tolist() if t5i is not None else None,
+            top5_p=t5p.tolist() if t5p is not None else None, rank=rank.tolist() if rank is not None else None,
+            row_p=rowp.tolist() if rowp is not None else None,
+            final_ids=[int(x) for x in final_target_ids], prompt_rows=rows)
 
     def scan_init_token(
         self,
@@ -911,6 +975,9 @@ class BAITWrapper:
         start_time = time()
         scan_result = scanner.run()
         end_time = time()
+        if scanner.save_pool:  # BAIT_SAVE_POOL=1: every inverted candidate with its per-step statistics, one JSON object per line
+            with open(os.path.join(self.log_dir, "candidates.jsonl"), "w") as f:
+                for rec in scanner.pool: f.write(json.dumps(rec) + "\n")
 
         return {
             "is_backdoor": scan_result.is_backdoor,
