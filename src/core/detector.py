@@ -106,7 +106,7 @@ class BAIT:
         distribution over the prompt rows; tok: (n,) chosen token; rows: (n, P, V) per-row distributions."""
         a = avg.float()
         ent = -(a * a.clamp_min(1e-12).log()).sum(-1)
-        tp, ti = torch.topk(a, 5, dim=-1)
+        tp, ti = torch.topk(a, int(os.getenv("BAIT_POOL_TOPK", "20")), dim=-1)
         chosen = a.gather(1, tok.view(-1, 1)).squeeze(1)
         rank = (a > chosen.unsqueeze(1)).sum(-1)
         rowp = rows.float().gather(2, tok.view(-1, 1, 1).expand(-1, rows.shape[1], 1)).squeeze(2)
@@ -975,6 +975,15 @@ class BAITWrapper:
         start_time = time()
         scan_result = scanner.run()
         end_time = time()
+        try:  # reproducibility record next to the results: code version (git hash + hash of the source tree), BAIT_* settings, host
+            import hashlib, subprocess, glob
+            src = hashlib.sha256(b"".join(open(f, "rb").read() for f in sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "*.py"))))).hexdigest()
+            git = subprocess.run(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+            with open(os.path.join(self.log_dir, "run_info.json"), "w") as f:
+                json.dump({"git_head": git, "core_src_sha256": src, "env": {k: v for k, v in os.environ.items() if k.startswith("BAIT_") and "KEY" not in k},
+                           "n_candidates": len(scanner.pool), "time_taken": end_time - start_time, "finished": time()}, f, indent=1)
+        except Exception as e:  # never lose a scan over bookkeeping
+            logger.warning(f"run_info.json not written: {e}")
         if scanner.save_pool:  # BAIT_SAVE_POOL=1: every inverted candidate with its per-step statistics, one JSON object per line
             with open(os.path.join(self.log_dir, "candidates.jsonl"), "w") as f:
                 for rec in scanner.pool: f.write(json.dumps(rec) + "\n")
